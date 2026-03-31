@@ -351,13 +351,16 @@ def test(model_path, output_dir, log_dir):
     model = models.load_model(model_path, device)
     
     # Create test dataset
-    test_dataset = dataloader.BrainDataset(
+    test_dataset = dataloader.BidsDataset(
         csv_file=cfg.CSV_TEST,
         root_dir=cfg.TENSOR_DIR_TEST,
         column_name=cfg.COLUMN_NAME,
         num_rows=None,
         num_classes=cfg.N_CLASSES,
-        task='classification'
+        task='classification',
+        bidstags="space-MNI152",
+        session="001"
+
     )
     
     test_loader = DataLoader(

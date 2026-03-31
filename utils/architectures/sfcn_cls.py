@@ -29,7 +29,7 @@ class SFCN(nn.Module):
                                                                   kernel_size=1,
                                                                   padding=0))
         self.classifier = nn.Sequential()
-        avg_shape = [3, 3, 3]
+        avg_shape = [3,3,3]
         self.classifier.add_module('average_pool', nn.AvgPool3d(avg_shape))
         if dropout is True:
             self.classifier.add_module('dropout', nn.Dropout(0.5))
