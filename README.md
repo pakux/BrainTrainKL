@@ -8,10 +8,10 @@ Train and evaluate deep learning models on 3D brain MRI data with support for se
 
 ## Features
 
-- **Multiple Training Modes** - SFCN, linear probing, SSL fine-tuning, and LoRA
+- **Multiple Training Modes** - SFCN, Densenet, SwinTransformer, FM linear probing, FM full fine-tuning and LoRA finetuning
 - **Self-Supervised Learning** - Pretrain on unlabeled brain MRI data
 - **Evaluation** - ROC/PRC curves, confusion matrices, bootstrap confidence intervals
-- **Explainability** - GradCAM and saliency maps with AAL atlas region analysis
+- **Explainability** - GradCAM, gradient and saliency maps with additional regional analysis as per AAL atlas
 - **Preprocessing** - DICOM to NIfTI conversion, bias correction, registration, skull stripping, resampling npy transformations
 
 ## Installation
@@ -56,7 +56,7 @@ sub002,0
 (If you have DCMs, run preprocessing.py to get npy tensors first.)
 After preprocessing:
 - **Format:** NumPy arrays saved as `.npy` files
-- **Shape:** `(96, 96, 96)` for 3D MRI volumes
+- **Shape:** `(96, 96, 96)` for 3D MRI volumes or (180, 180, 180)
 - **Naming:** Filename must match `eid` in CSV (e.g., `sub001.npy`)
 
 ## Quick Start

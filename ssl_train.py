@@ -16,7 +16,7 @@ from utils.augmentations.ssl_transforms import double_view_transform
 from utils.architectures import sfcn_ssl2
 
 # Import config
-import config
+import BrainTrain.config as config
 
 # Seeding
 set_determinism(seed=config.SEED)
@@ -63,9 +63,9 @@ model = model.to(device)
 
 # Loss and optimizer
 contrastive_loss = ContrastiveLoss(temperature=config.CONTRASTIVE_TEMPERATURE)
-optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+optimizer = torch.optim.Adam(model.parameters(), lr=config.LR_SSL)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode="min", factor=config.SCHEDULER_FACTOR, patience=config.SCHEDULER_PATIENCE
+    optimizer, mode="min", factor=config.SCHEDULER_FACTOR_SSL, patience=config.SCHEDULER_PATIENCE_SSL
 )
 
 
@@ -165,19 +165,19 @@ for epoch in range(config.MAX_EPOCHS_SSL):
         else:
             patience_counter += 1
             print(f"No improvement for {patience_counter} epochs")
-            if patience_counter >= config.PATIENCE:
+            if patience_counter >= config.PATIENCE_SSL:
                 print(f"Early stopping at epoch {epoch + 1}")
                 break
         
         # Plot
         plt.figure(figsize=(10, 5))
         plt.plot(epoch_loss_values, label="Train")
-        plt.plot(range(0, len(val_loss_values) * config.VAL_INTERVAL, config.VAL_INTERVAL), val_loss_values, label="Val")
+        plt.plot(range(0, len(val_loss_values) * config.VAL_INTERVAL_SSL, config.VAL_INTERVAL_SSL), val_loss_values, label="Val")
         plt.legend()
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
         plt.grid()
-        plt.savefig(os.path.join(config.LOG_DIR, f"loss_plot_b{config.BATCH_SIZE}_e{config.MAX_EPOCHS}.png"))
+        plt.savefig(os.path.join(config.LOG_DIR, f"loss_plot_b{config.BATCH_SIZE_SSL}_e{config.MAX_EPOCHS_SSL}.png"))
         plt.close()
 
 print("\nTraining completed!")

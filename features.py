@@ -16,7 +16,7 @@ from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from monai.data import DataLoader, Dataset
 from utils.architectures import sfcn_ssl2
-import config as c
+import BrainTrain.config as c
 from utils.dataloaders import dataloader_ssl
 
 
@@ -231,7 +231,7 @@ def compute_embedding(
         )
         embedding = reducer.fit_transform(X)
         explained_var = reducer.explained_variance_ratio_
-        print(f"✅ PCA embedding shape: {embedding.shape}")
+        print(f"PCA embedding shape: {embedding.shape}")
         print(f"   Explained variance: {explained_var[0]:.2%}, {explained_var[1]:.2%}")
         
     else:

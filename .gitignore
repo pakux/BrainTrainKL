@@ -6,8 +6,9 @@ __pycache__/
 .Python
 *.egg-info/
 dist/
-build/
-
+slurm-*.out
+main*.sh*
+config1.py
 # Virtual environments
 .venv/
 venv/
@@ -38,3 +39,4 @@ data/
 images/
 features/
 representations/
+utils/assets/

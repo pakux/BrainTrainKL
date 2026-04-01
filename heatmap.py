@@ -33,24 +33,42 @@ def find_last_conv_layer(model):
     return last_conv
 
 
+def _normalize_batch_maps(maps, mode="magnitude"):
+    """Normalize attention maps per sample.
+
+    Args:
+        maps: torch.Tensor [B, D, H, W]
+        mode: 'magnitude' -> [0, 1], 'signed' -> [-1, 1]
+    """
+    flat = maps.flatten(1)
+    if mode == "magnitude":
+        mins = flat.min(dim=1)[0].view(-1, 1, 1, 1)
+        maxs = flat.max(dim=1)[0].view(-1, 1, 1, 1)
+        denom = (maxs - mins).clamp_min(1e-8)
+        return (maps - mins) / denom
+
+    max_abs = flat.abs().max(dim=1)[0].view(-1, 1, 1, 1).clamp_min(1e-8)
+    return maps / max_abs
+
+
 def compute_gradcam(
-    model, image, target_layer, target="logit_diff", class_idx=None, mode="magnitude"
+    model, images, target_layer, target="logit_diff", class_idx=None, mode="magnitude"
 ):
     """
     Compute GradCAM attention map using intermediate layer activations.
 
     Args:
         model: PyTorch model
-        image: Input image tensor [1,1,D,H,W]
+        images: Input image tensor [B,1,D,H,W]
         target_layer: Layer to compute gradients for
-        target: 'logit_diff' (default), 'pred', or 'target_class'
+        target: 'logit_diff' (default), 'pred', 'target_class', or 'output'
         class_idx: Target class index (only used if target='target_class')
         mode: 'magnitude' (ReLU applied) or 'signed' (preserve sign)
 
     Returns:
-        gradcam: Attention map [D,H,W]
-        pred_class: Predicted class
-        confidence: Prediction confidence
+        gradcams: Attention maps [B,D,H,W]
+        pred_classes: Predicted class per sample [B]
+        confidences: Prediction confidence per sample [B]
     """
     activations = []
     gradients = []
@@ -68,24 +86,40 @@ def compute_gradcam(
     try:
         # Forward pass
         model.zero_grad(set_to_none=True)
-        logits = model(image)
+        logits = model(images)
         probs = torch.softmax(logits, dim=1)
 
         # Determine target and get predictions
+
         if target == "logit_diff" and logits.shape[1] == 2:
-            score = logits[0, 1] - logits[0, 0]
-            pred_class = int(probs[0, 1] > probs[0, 0])
-            conf = probs[0, pred_class].item()
+            score = (logits[:, 1] - logits[:, 0]).sum()
+            pred_classes = (probs[:, 1] > probs[:, 0]).long()
+            confs = probs.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
+        elif target == "output":
+            # Regression-style target: use raw model output.
+            if logits.dim() > 1 and logits.shape[1] == 1:
+                out = logits[:, 0]
+            elif logits.dim() == 1:
+                out = logits
+            else:
+                raise ValueError(
+                    "target='output' expects regression output shape [B] or [B,1]"
+                )
+            score = out.sum()
+            pred_classes = torch.zeros(
+                out.shape[0], dtype=torch.long, device=out.device
+            )
+            confs = out.abs()
         elif target == "pred":
-            pred_class = torch.argmax(probs, dim=1).item()
-            score = logits[0, pred_class]
-            conf = probs[0, pred_class].item()
+            pred_classes = torch.argmax(probs, dim=1)
+            score = logits.gather(1, pred_classes.unsqueeze(1)).squeeze(1).sum()
+            confs = probs.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
         elif target == "target_class":
             if class_idx is None:
                 raise ValueError("Must specify class_idx when target='target_class'")
-            pred_class = torch.argmax(probs, dim=1).item()
-            score = logits[0, class_idx]
-            conf = probs[0, class_idx].item()
+            pred_classes = torch.argmax(probs, dim=1)
+            score = logits[:, class_idx].sum()
+            confs = probs[:, class_idx]
         else:
             raise ValueError(f"Unknown target: {target}")
 
@@ -93,8 +127,9 @@ def compute_gradcam(
         score.backward()
 
         # Compute GradCAM
-        act = activations[0]  # [1, C, D, H, W]
-        grad = gradients[0]  # [1, C, D, H, W]
+
+        act = activations[0]  # [B, C, D, H, W]
+        grad = gradients[0]  # [B, C, D, H, W]
 
         # Global average pooling of gradients
         weights = grad.mean(dim=(2, 3, 4), keepdim=True)  # [1, C, 1, 1, 1]
@@ -107,20 +142,19 @@ def compute_gradcam(
             cam = F.relu(cam)
         # else: keep signed values (mode == 'signed')
 
-        cam = cam.squeeze().cpu().numpy()  # [D, H, W]
+        cam = cam.squeeze(1)  # [B, D, H, W]
 
         # Normalize
         if mode == "magnitude":
             # Normalize to [0, 1]
-            if cam.max() > 0:
-                cam = (cam - cam.min()) / (cam.max() - cam.min())
-        else:  # signed
-            # Normalize to [-1, 1] while preserving sign
-            max_abs = np.abs(cam).max()
-            if max_abs > 0:
-                cam = cam / max_abs
 
-        return cam, pred_class, conf
+            cam = _normalize_batch_maps(cam, mode="signed")
+
+        return (
+            cam.detach().cpu().numpy(),
+            pred_classes.detach().cpu().tolist(),
+            confs.detach().cpu().tolist(),
+        )
 
     finally:
         handle_f.remove()
@@ -194,44 +228,58 @@ def quantify_major_regions(heatmap, atlas_path, label_dict, signed=False):
 
 
 def compute_saliency(
-    model, image, target="logit_diff", class_idx=None, mode="magnitude"
+    model, images, target="logit_diff", class_idx=None, mode="magnitude"
 ):
     """
     Compute saliency map (gradient of output w.r.t. input).
 
     Args:
         model: PyTorch model
-        image: Input image tensor [1,1,D,H,W]
-        target: 'logit_diff' (default), 'pred', or 'target_class'
+        images: Input image tensor [B,1,D,H,W]
+        target: 'logit_diff' (default), 'pred', 'target_class', or 'output'
         class_idx: Target class index (only used if target='target_class')
         mode: 'magnitude' (absolute value) or 'signed' (preserve sign)
 
     Returns:
-        saliency: Attention map [D,H,W]
-        pred_class: Predicted class
-        confidence: Prediction confidence
+        saliency: Attention maps [B,D,H,W]
+        pred_class: Predicted class per sample [B]
+        confidence: Prediction confidence per sample [B]
     """
-    image.requires_grad = True
+    images = images.clone().detach().requires_grad_(True)
     model.zero_grad(set_to_none=True)
 
-    logits = model(image)
+    logits = model(images)
     probs = torch.softmax(logits, dim=1)
 
     # Determine target
+
     if target == "logit_diff" and logits.shape[1] == 2:
-        score = logits[0, 1] - logits[0, 0]
-        pred_class = int(probs[0, 1] > probs[0, 0])
-        conf = probs[0, pred_class].item()
+        score = (logits[:, 1] - logits[:, 0]).sum()
+        pred_classes = (probs[:, 1] > probs[:, 0]).long()
+        confs = probs.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
+    elif target == "output":
+        # Regression-style target: use raw model output.
+        if logits.dim() > 1 and logits.shape[1] == 1:
+            out = logits[:, 0]
+        elif logits.dim() == 1:
+            out = logits
+        else:
+            raise ValueError(
+                "target='output' expects regression output shape [B] or [B,1]"
+            )
+        score = out.sum()
+        pred_classes = torch.zeros(out.shape[0], dtype=torch.long, device=out.device)
+        confs = out.abs()
     elif target == "pred":
-        pred_class = torch.argmax(probs, dim=1).item()
-        score = logits[0, pred_class]
-        conf = probs[0, pred_class].item()
+        pred_classes = torch.argmax(probs, dim=1)
+        score = logits.gather(1, pred_classes.unsqueeze(1)).squeeze(1).sum()
+        confs = probs.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
     elif target == "target_class":
         if class_idx is None:
             raise ValueError("Must specify class_idx when target='target_class'")
-        pred_class = torch.argmax(probs, dim=1).item()
-        score = logits[0, class_idx]
-        conf = probs[0, class_idx].item()
+        pred_classes = torch.argmax(probs, dim=1)
+        score = logits[:, class_idx].sum()
+        confs = probs[:, class_idx]
     else:
         raise ValueError(f"Unknown target: {target}")
 
@@ -239,20 +287,80 @@ def compute_saliency(
     score.backward()
 
     # Get saliency map
-    if mode == "magnitude":
-        saliency = image.grad.data.abs().squeeze().cpu().numpy()  # [D, H, W]
-        # Normalize to [0, 1]
-        if saliency.max() > 0:
-            saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min())
-    else:  # signed
-        saliency = image.grad.data.squeeze().cpu().numpy()  # [D, H, W]
-        # Normalize to [-1, 1] while preserving sign
-        max_abs = np.abs(saliency).max()
-        if max_abs > 0:
-            saliency = saliency / max_abs
 
-    image.requires_grad = False
-    return saliency, pred_class, conf
+    if mode == "magnitude":
+        saliency = images.grad.data.abs().mean(dim=1)  # [B, D, H, W]
+        saliency = _normalize_batch_maps(saliency, mode="magnitude")
+    else:  # signed
+        saliency = images.grad.data.mean(dim=1)  # [B, D, H, W]
+        saliency = _normalize_batch_maps(saliency, mode="signed")
+
+    return (
+        saliency.detach().cpu().numpy(),
+        pred_classes.detach().cpu().tolist(),
+        confs.detach().cpu().tolist(),
+    )
+
+
+def compute_inputxgradient(
+    model, images, target="logit_diff", class_idx=None, mode="magnitude"
+):
+    """
+    Compute Input x Gradient attention map.
+
+    IxG = input * d(score)/d(input)
+    """
+    images = images.clone().detach().requires_grad_(True)
+    model.zero_grad(set_to_none=True)
+
+    logits = model(images)
+    probs = torch.softmax(logits, dim=1)
+
+    # Determine target
+    if target == "logit_diff" and logits.shape[1] == 2:
+        score = (logits[:, 1] - logits[:, 0]).sum()
+        pred_classes = (probs[:, 1] > probs[:, 0]).long()
+        confs = probs.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
+    elif target == "output":
+        if logits.dim() > 1 and logits.shape[1] == 1:
+            out = logits[:, 0]
+        elif logits.dim() == 1:
+            out = logits
+        else:
+            raise ValueError(
+                "target='output' expects regression output shape [B] or [B,1]"
+            )
+        score = out.sum()
+        pred_classes = torch.zeros(out.shape[0], dtype=torch.long, device=out.device)
+        confs = out.abs()
+    elif target == "pred":
+        pred_classes = torch.argmax(probs, dim=1)
+        score = logits.gather(1, pred_classes.unsqueeze(1)).squeeze(1).sum()
+        confs = probs.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
+    elif target == "target_class":
+        if class_idx is None:
+            raise ValueError("Must specify class_idx when target='target_class'")
+        pred_classes = torch.argmax(probs, dim=1)
+        score = logits[:, class_idx].sum()
+        confs = probs[:, class_idx]
+    else:
+        raise ValueError(f"Unknown target: {target}")
+
+    score.backward()
+    ixg = images.grad.data * images.data  # [B, C, D, H, W]
+
+    if mode == "magnitude":
+        att = ixg.abs().mean(dim=1)  # [B, D, H, W]
+        att = _normalize_batch_maps(att, mode="magnitude")
+    else:  # signed
+        att = ixg.mean(dim=1)  # [B, D, H, W]
+        att = _normalize_batch_maps(att, mode="signed")
+
+    return (
+        att.detach().cpu().numpy(),
+        pred_classes.detach().cpu().tolist(),
+        confs.detach().cpu().tolist(),
+    )
 
 
 def load_image(path, device):
@@ -269,6 +377,20 @@ def load_image(path, device):
     # Model input version
     img_t = torch.from_numpy(img_data).float().unsqueeze(0).unsqueeze(0).to(device)
     return img_t, img_np
+
+
+def tensor_to_display_image(image_tensor):
+    """Convert a single [D,H,W] tensor/array to 8-bit for visualization."""
+    if torch.is_tensor(image_tensor):
+        img_data = image_tensor.detach().cpu().numpy()
+    else:
+        img_data = np.asarray(image_tensor)
+    p1, p99 = np.percentile(img_data, (1, 99))
+    img_np = np.clip(img_data, p1, p99)
+    img_np = (
+        (img_np - img_np.min()) / max(img_np.max() - img_np.min(), 1e-8) * 255
+    ).astype(np.uint8)
+    return img_np
 
 
 def save_visualization(heatmap, image, name, output_dir, signed=False, affine=None):
@@ -334,11 +456,12 @@ def save_visualization(heatmap, image, name, output_dir, signed=False, affine=No
             )
 
         ax.set_title(f"{view.capitalize()} (slice {slice_idx})", fontsize=12)
+
         ax.axis("off")
 
-    plt.colorbar(im, ax=axes, fraction=0.046, pad=0.04)
+    fig.colorbar(im, ax=axes, orientation="horizontal", fraction=0.05, pad=0.08)
     plt.suptitle(name, fontsize=14, fontweight="bold")
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0.08, 1, 0.95])
 
     save_path = os.path.join(output_dir, f"{name}.png")
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -386,17 +509,41 @@ def generate_heatmaps(
     df = pd.read_csv(cfg.CSV_TEST)
     print(f"Test dataset size: {len(df)}")
 
+    class_to_index = None
+    if cfg.TASK == "classification":
+        class_to_index = label_mapping.resolve_or_create_label_mapping(
+            csv_path=cfg.CSV_TRAIN,
+            column_name=cfg.COLUMN_NAME,
+            mapping_path=cfg.LABEL_MAP_PATH,
+            auto_create=getattr(cfg, "LABEL_MAP_AUTO", False),
+        )
+        if class_to_index is not None:
+            mapped_n_classes = len(class_to_index)
+            if cfg.N_CLASSES_EXPLICIT and cfg.N_CLASSES != mapped_n_classes:
+                raise ValueError(
+                    f"N_CLASSES={cfg.N_CLASSES} does not match label map size "
+                    f"{mapped_n_classes} at {cfg.LABEL_MAP_PATH}"
+                )
+            if not cfg.N_CLASSES_EXPLICIT and cfg.N_CLASSES != mapped_n_classes:
+                print(
+                    f"Updating N_CLASSES from {cfg.N_CLASSES} to {mapped_n_classes} based on label map."
+                )
+                cfg.N_CLASSES = mapped_n_classes
+            print(f"Using label map: {cfg.LABEL_MAP_PATH}")
+
     # Create test dataset
     test_dataset = dataloader.BrainDataset(
         csv_file=cfg.CSV_TEST,
         root_dir=cfg.TENSOR_DIR_TEST,
         column_name=cfg.COLUMN_NAME,
-        num_rows=None,
+        num_rows=cfg.NROWS,
         num_classes=cfg.N_CLASSES,
-        task="classification",
+        # task="classification",
         # bidstags="space-MNI152",
         # session="001",
         # modality="T1w",
+        task=cfg.TASK,
+        label_mapping=class_to_index,
     )
 
     print(f"Test dataset size: {len(test_dataset)}")
@@ -435,48 +582,104 @@ def generate_heatmaps(
         # Compute attention
         if attention_method == "gradcam":
             att_map, pred_class, confidence = compute_gradcam(
+                model, image_t, target_layer
+            )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=cfg.BATCH_SIZE,
+        num_workers=cfg.NUM_WORKERS,
+        drop_last=False,
+    )
+
+    # Process images
+    results = []
+    all_region_scores = []
+    signed = attention_mode == "signed"
+    do_quantify = (
+        bool(getattr(cfg, "QUANTIFY_REGIONS", True))
+        and bool(atlas_path)
+        and bool(label_dict)
+    )
+
+    print("\nGenerating heatmaps...")
+    stop_after_single = False
+    for eids, images, labels in tqdm(
+        test_loader, total=len(test_loader), desc="Processing"
+    ):
+        images = images.to(device)
+
+        # Compute attention for full batch
+        if attention_method == "gradcam":
+            att_maps, pred_classes, confidences = compute_gradcam(
                 model,
-                image_t,
+                images,
                 target_layer,
                 target=attention_target,
                 class_idx=attention_class_idx,
                 mode=attention_mode,
             )
-        else:  # saliency
-            att_map, pred_class, confidence = compute_saliency(
+
+        elif attention_method == "saliency":
+            att_maps, pred_classes, confidences = compute_saliency(
                 model,
-                image_t,
+                images,
                 target=attention_target,
                 class_idx=attention_class_idx,
                 mode=attention_mode,
             )
-
-        results.append(
-            {
-                "heatmap": att_map,
-                "image": image_np,
-                "confidence": confidence,
-                "pred_class": pred_class,
-                "true_class": label,
-                "eid": eid,
-            }
-        )
-
-        # QUANTIFY REGIONS (if atlas provided)
-        if atlas_path and label_dict:
-            region_scores = quantify_regions(
-                att_map, atlas_path, label_dict, signed=signed
+        elif attention_method == "inputxgradient":
+            att_maps, pred_classes, confidences = compute_inputxgradient(
+                model,
+                images,
+                target=attention_target,
+                class_idx=attention_class_idx,
+                mode=attention_mode,
             )
-            region_scores["eid"] = eid
-            all_region_scores.append(region_scores)
-
-            major_region_scores = quantify_major_regions(
-                att_map, atlas_path, label_dict, signed=signed
+        else:
+            raise ValueError(
+                f"Unknown ATTENTION_METHOD: {attention_method}. "
+                "Expected one of: 'gradcam', 'saliency', 'inputxgradient'."
             )
-            major_region_scores["eid"] = eid
-            all_major_region_scores.append(region_scores)
 
-        if mode == "single":
+        # Unpack batch and keep existing output structure.
+        for b, eid in enumerate(eids):
+            if cfg.TASK == "classification":
+                if labels.dim() > 1:
+                    true_class = int(torch.argmax(labels[b]).item())
+                else:
+                    true_class = int(labels[b].item())
+            else:
+                true_class = float(labels[b].item())
+
+            att_map = att_maps[b]
+            image_np = tensor_to_display_image(images[b, 0])
+            pred_class = int(pred_classes[b])
+            confidence = float(confidences[b])
+
+            results.append(
+                {
+                    "heatmap": att_map,
+                    "image": image_np,
+                    "confidence": confidence,
+                    "pred_class": pred_class,
+                    "true_class": true_class,
+                    "eid": str(eid),
+                }
+            )
+
+            # QUANTIFY REGIONS (if enabled)
+            if do_quantify:
+                region_scores = quantify_regions(
+                    att_map, atlas_path, label_dict, signed=signed
+                )
+                region_scores["eid"] = str(eid)
+                all_region_scores.append(region_scores)
+
+            if mode == "single":
+                stop_after_single = True
+                break
+
+        if stop_after_single:
             break
 
     if all_major_region_scores:
@@ -496,6 +699,10 @@ def generate_heatmaps(
 
     # Generate visualizations
     print("\nCreating visualizations...")
+
+    if not results:
+        print("No valid samples were processed. Skipping visualization export.")
+        return results
 
     if mode == "single":
         result = results[0]
@@ -532,12 +739,40 @@ def generate_heatmaps(
         top_positive = sorted(
             positive_results, key=lambda x: x["confidence"], reverse=True
         )[:top_n]
-        # ... rest of code
+
         for i, result in enumerate(top_positive):
             save_visualization(
                 result["heatmap"],
                 result["image"],
                 f"top{i + 1}_{result['eid']}_conf{result['confidence']:.3f}",
+                heatmap_dir,
+                signed=signed,
+            )
+
+    elif mode == "average_and_random":
+        # Save overall average across all processed samples.
+        avg_heatmap = np.mean([r["heatmap"] for r in results], axis=0)
+        save_visualization(
+            avg_heatmap,
+            results[0]["image"],
+            "average_overall",
+            heatmap_dir,
+            signed=signed,
+        )
+
+        # Save N random individual heatmaps.
+        random_n = max(1, int(getattr(cfg, "HEATMAP_RANDOM_N", 5)))
+        random_seed = int(getattr(cfg, "HEATMAP_RANDOM_SEED", 42))
+        sample_n = min(random_n, len(results))
+        rng = np.random.default_rng(random_seed)
+        random_indices = rng.choice(len(results), size=sample_n, replace=False)
+
+        for i, idx in enumerate(random_indices):
+            result = results[int(idx)]
+            save_visualization(
+                result["heatmap"],
+                result["image"],
+                f"random{i + 1}_{result['eid']}_conf{result['confidence']:.3f}",
                 heatmap_dir,
                 signed=signed,
             )
@@ -568,7 +803,10 @@ def main():
     """Main function"""
     # Setup
     if torch.cuda.is_available():
-        torch.cuda.set_device(cfg.DEVICE)
+        if isinstance(cfg.DEVICE, str) and cfg.DEVICE.startswith("cuda:"):
+            torch.cuda.set_device(int(cfg.DEVICE.split(":")[1]))
+        else:
+            torch.cuda.set_device(cfg.DEVICE)
     torch.manual_seed(42)
 
     print("\n" + "=" * 70)
@@ -591,8 +829,8 @@ def main():
     heatmap_dir = os.path.join(cfg.EXPLAINABILITY_DIR, explainability_path)
 
     # ADD ATLAS PATH (adjust to your actual atlas location)
-    atlas_path = cfg.ATLAS_PATH  # Update this!
-    label_dict = atlas_labels.LABEL_DICT  # Make sure this is defined in config
+    atlas_path = cfg.ATLAS_PATH
+    label_dict = atlas_labels.LABEL_DICT
 
     # Generate heatmaps with regional analysis
     generate_heatmaps(
@@ -601,8 +839,8 @@ def main():
         attention_mode=attention_mode,
         mode=mode,
         top_n=top_n,
-        attention_target="logit_diff",
-        attention_class_idx=None,
+        attention_target=cfg.ATTENTION_TARGET,
+        attention_class_idx=cfg.ATTENTION_CLASS_IDX,
         atlas_path=atlas_path,
         label_dict=label_dict,
     )
@@ -612,15 +850,19 @@ def main():
     # NOW RUN REGIONAL ANALYSIS
     print("\n" + "=" * 70)
     print("REGIONAL ANALYSIS")
+
     print("=" * 70)
 
-    config_for_analysis = {
-        "regional_csv": os.path.join(heatmap_dir, "regional_scores.csv"),
-        "cohort": cfg.TEST_COHORT,
-    }
+    if getattr(cfg, "QUANTIFY_REGIONS", True):
+        config_for_analysis = {
+            "regional_csv": os.path.join(heatmap_dir, "regional_scores.csv"),
+            "cohort": cfg.TEST_COHORT,
+        }
 
-    save_fig_path = os.path.join(heatmap_dir, "regional_analysis.png")
-    analyze_regions(config_for_analysis, top_k=cfg.N_REGIONS, save_path=save_fig_path)
+        save_fig_path = os.path.join(heatmap_dir, "regional_analysis.png")
+        analyze_regions(
+            config_for_analysis, top_k=cfg.N_REGIONS, save_path=save_fig_path
+        )
 
     print("\n✓ All done!")
 
@@ -734,4 +976,3 @@ def analyze_regions(config, top_k=100, save_path=None):
 
 if __name__ == "__main__":
     main()
-

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import config as cfg
 
+
 class ClassifierHeadMLP_(nn.Module):
     def __init__(self, backbone, output_dim=cfg.N_CLASSES):
         super().__init__()
@@ -11,6 +12,7 @@ class ClassifierHeadMLP_(nn.Module):
     def forward(self, x):
         feats = self.backbone(x, return_projection=False)  # Only use features
         return self.classifier(feats)
+
 
 class RegressorHeadMLP_(nn.Module):
     def __init__(self, backbone, output_dim=cfg.N_CLASSES):
